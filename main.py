@@ -1,100 +1,98 @@
-from fastapi import FastAPI, Query, HTTPException, Path
-from pydantic import BaseModel
-from typing import Optional
-import json
+from fastapi import FastAPI, Depends, HTTPException, Response, status
+from typing import List, Annotated, Optional
+from models import Base, engine, ToDoItem, SessionLocal, ToDoItemCreate, ToDoItemResponse
+from sqlalchemy.orm import Session
+import pandas as pd
+import io
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-# Because you can only do GET requests in the browser, you have to use test your code in your local host (i.e. http://127.0.0.1:8000/docs)
+def create_tables():
+    Base.metadata.create_all(bind=engine)
+create_tables()
 
 app = FastAPI()
 
-class Person(BaseModel):
-    # Make id not required, because we'll calculate id for the user when a post request is submitted (see add_person function)
-    id: Optional[int] = None
-    name: str
-    age: int
-    gender: str
+security = HTTPBasic()
 
+# type hinting that the todo_list is a list of ToDoItems, then initialize to an empty list
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-with open('people.json', 'r') as f:
-    people = json.load(f)
+def get_all_todos(db: Session):
+    return db.query(ToDoItem).all()
 
-@app.get('/person/{p_id}', status_code=200)
-def get_person(p_id: int):
-    # Queries all the instances of the id in the people.json file, but assuming each id is unique, it's only going to return one json object
-    person = [p for p in people if p["id"] == p_id]
+def get_non_completed_todos(db: Session):
+    return db.query(ToDoItem).filter(ToDoItem.completed == False).all()
 
-    return person[0] if len(person) > 0 else {}
+def get_num_entries(db: Session):
+    num_entries = db.query(ToDoItem).count()
+    return num_entries
 
-# Because we're querying, we don't need to pass into the 'get'
-@app.get("/search", status_code=200)
-def search(age: Optional[int] = Query(None, title="Age", description="The age to filter for"), name: Optional[str] = Query(None, title="Name", description="The name to filter for")):
-    people1 = [p for p in people if p["age"] == age]
+@app.post("/todos/", response_model=ToDoItemResponse, status_code=201)
+def create_todo(todo: ToDoItemCreate, db: Session = Depends(get_db)):
+    db_item = ToDoItem(title=todo.title, description=todo.description, completed=todo.completed)
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
 
-    if name is None:
-        if age is None:
-            return people
+@app.get("/todos/", response_model=List[ToDoItemResponse], status_code=200)
+def return_todos(retrieve_all_todos: Optional[bool] = False, db: Session = Depends(get_db)):
+    if retrieve_all_todos:
+        return get_all_todos(db)
+    db_todo_items = get_non_completed_todos(db)
+    num_entries = get_num_entries(db)
+    if num_entries > 0:
+        if db_todo_items:
+            return db_todo_items
         else:
-            return people1
+            raise HTTPException(status_code=404, detail="All todos are completed")
     else:
-        # don't want to do p["name"] == name, because we want to be lenient on the passing parameters, so it can also work out if it's a substring of p["name"]
-        people2 = [p for p in people if name.lower() in p["name"].lower()]
-        if age is None:
-            return people2
-        else:
-            combined = [p for p in people if name.lower() in p["name"].lower() and p["age"] == age]
-            return combined
+        raise HTTPException(status_code=404, detail="ToDoList is empty")
 
-@app.post('/addPerson', status_code=201)
-def add_person(person: Person):
-    p_id = max([p["id"] for p in people]) + 1
-    new_person = {
-        "id": p_id,
-        "name" : person.name,
-        "age":person.age,
-        "gender":person.gender
-    }
+@app.put("/todos/{title}", status_code=200, response_model=ToDoItemResponse)
+def complete_todo(title: str, db: Session = Depends(get_db)):
+    fetched_item = db.query(ToDoItem).filter(ToDoItem.title.ilike(title.strip())).first()
+    if fetched_item is None:
+        raise HTTPException(status_code=404, detail="No todo with that title")
+    if fetched_item.completed:
+        raise HTTPException(status_code=404, detail="Todo is already completed")
+    fetched_item.completed = True
+    db.commit()
 
-    people.append(new_person)
-    
-    write_to_json()
-    
-    return {"Success": "Post request has been achieved"}
+    return fetched_item
 
-@app.put('/changePerson', status_code=204)
-def change_person(person: Person):
-    new_person = {
-        "id":person.id,
-        "name": person.name,
-        "age":person.age,
-        "gender":person.gender
-    }
+@app.delete("/todos/", status_code=204)
+def delete_todo(todo_id: int, db: Session = Depends(get_db)):
+    fetched_item = db.query(ToDoItem).filter(ToDoItem.id == id)
+    if fetched_item:
+        db.delete(fetched_item)
+        db.commit()
+        return
+    raise HTTPException(status_code=404, detail="ToDoItem with inputted id was not found")
 
-    for person in people:
-        if person["id"] == new_person["id"]:
-            people.remove(person)
-            people.append(new_person)
-            write_to_json()
-    # If above code block doesn't go through, because it wouldn't return, then we throw an exception
-    return HTTPException(status_code=404, detail=f"Person with id {person.id} does not exist")
+@app.get("/todos/export_csv", response_class=Response)
+def export_as_csv(db: Session = Depends(get_db)):
+    todos = get_all_todos(db)
+    # Convert each entry in the database to a dictionary and then convert it to a dataframe
+    df = pd.DataFrame([todo.__dict__ for todo in todos])
 
-# Usually with delete requests, it's status code 204, which means return 'no content'
-@app.delete('/deletePerson/{p_id}', status_code=200)
-# Can use Path or Query interchangeably
-def delete_person(p_id: int = Path(title="id", description="id of person to delete from database")):
-    if p_id:
-        person_delete = [p for p in people if p["id"] == p_id]
-        if len(person_delete) > 0:
-            people.remove(person_delete[0])
-            write_to_json()
-            print(person_delete[0])
-            return person_delete[0]
-        else:
-            return HTTPException(status_code=404, detail=f"The id is not valid or not found")
-    return HTTPException(status_code=404, detail=f"The id is not valid or not found in the database")
+    # Drop the column that is specifically for sqlalchemy
+    df = df.drop('_sa_instance_state', axis=1)
 
+    #convert dataframe to csv
+    stream = io.StringIO()
+    df.to_csv(stream, index=False)
 
+    response = Response(content=stream.getvalue(), media_type="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=todos.csv"
 
-# Write to json after changes are done (post or put requests)
-def write_to_json():
-    with open("people.json", "w") as f:
-        json.dump(people, f)
+    return response
+
+@app.get("/users/me")
+def read_current_user(credentials: Annotated[HTTPBasicCredentials, Depends(security)]):
+    return {"username": credentials.username, "password": credentials.password}
